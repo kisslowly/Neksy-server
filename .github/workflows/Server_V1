@@ -1,0 +1,1249 @@
+#!/usr/bin/env python3
+"""
+Nexus Obsidian Server v7 - Anti-censorship server (Hardened)
+Supports: tunnels, E2E, rooms, wall, media files
+
+MIT License
+
+Copyright (c) 2025
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+import asyncio
+import json
+import base64
+import secrets
+import time
+import sqlite3
+import os
+import hashlib
+import hmac
+import struct
+import re
+import ssl
+from datetime import datetime
+from typing import Dict, Set, Tuple, Optional, List, Any
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+HOST = os.environ.get("NEXUS_HOST", "0.0.0.0")
+PORT = int(os.environ.get("NEXUS_PORT", "5556"))
+SEP = "<END_OF_PKT>"
+DB_FILE = os.environ.get("NEXUS_DB", "nexus_server.db")
+TLS_ENABLED = os.environ.get("NEXUS_TLS", "0").lower() in {"1", "true", "yes", "on"}
+TLS_CERT_FILE = os.environ.get("NEXUS_TLS_CERT", "cert.pem")
+TLS_KEY_FILE = os.environ.get("NEXUS_TLS_KEY", "key.pem")
+MAX_MESSAGE_SIZE = 16 * 1024 * 1024   # 16 MB
+MAX_CONNECTIONS = 1000
+RATE_LIMIT = 20                       # messages per second (global)
+MEDIA_CHUNK_LIMIT = 100               # max pending chunks per user
+DEBUG = False
+SECURITY_PROTOCOL_VERSION = 1
+SECURITY_TIMESTAMP_WINDOW_SEC = 300
+SECURITY_REPLAY_CACHE_LIMIT = 4096
+AUTH_FAIL_WINDOW_SEC = 300
+AUTH_FAIL_LIMIT = 6
+TOTP_FAIL_WINDOW_SEC = 900           # 15 minutes
+TOTP_FAIL_LIMIT = 5
+CLIENT_IDLE_TIMEOUT_SEC = int(os.environ.get("NEXUS_CLIENT_IDLE_TIMEOUT", "90"))
+CLIENT_STALE_TIMEOUT_SEC = int(os.environ.get("NEXUS_CLIENT_STALE_TIMEOUT", "45"))
+NO_LOGS_MODE = os.environ.get("NEXUS_NO_LOGS", "0").lower() in {"1", "true", "yes", "on"}
+
+connection_semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
+
+def sanitize_sensitive(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"vless://[^\s]+", "vless://***", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?i)(password|passwd|token|secret|key)=([^\s&;]+)", r"\1=***", text)
+    text = re.sub(r"(?i)(\"(?:password|token|secret|key)\"\s*:\s*\")[^\"]+", r"\1***", text)
+    text = re.sub(r"(?i)(://[^:/\s]+:)[^@/\s]+@", r"\1***@", text)
+    return text
+
+def dbg(*args):
+    if DEBUG and not NO_LOGS_MODE:
+        print("[SERVER DBG]", *(sanitize_sensitive(a) for a in args))
+
+def event_type_for_packet(mtype: str) -> str:
+    mapping = {
+        "chat": "text", "msg_reply": "text", "media_meta": "file", "media_chunk": "file",
+        "msg_react": "reaction", "typing": "status", "msg_status": "status", "ping": "status",
+        "pong": "status", "users": "status", "room_list": "system", "wall_list": "system",
+    }
+    return mapping.get(str(mtype or ""), "system")
+
+class ServerCryptoLayer:
+    def __init__(self, session_key: str):
+        self.session_key = str(session_key or "")
+        self._fernet = Fernet(self.session_key.encode())
+        self._seen_nonces: Dict[str, float] = {}
+        self.encrypted_count = 0
+        self.decrypted_count = 0
+
+    def encrypt(self, payload: bytes) -> bytes:
+        data = payload
+        try:
+            msg = json.loads(payload.decode("utf-8"))
+            if isinstance(msg, dict):
+                msg.setdefault("protocol_version", SECURITY_PROTOCOL_VERSION)
+                msg.setdefault("event_type", event_type_for_packet(msg.get("type", "")))
+                msg.setdefault("nonce", secrets.token_urlsafe(18))
+                msg.setdefault("timestamp", time.time())
+                data = json.dumps(msg, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except Exception:
+            pass
+        self.encrypted_count += 1
+        return self._fernet.encrypt(data)
+
+    def decrypt(self, token: bytes) -> bytes:
+        if len(token) > MAX_MESSAGE_SIZE:
+            raise ValueError("encrypted token too large")
+        data = self._fernet.decrypt(token)
+        try:
+            msg = json.loads(data.decode("utf-8"))
+            if isinstance(msg, dict):
+                self._validate_protocol(msg)
+                self._validate_timestamp(msg)
+                self._validate_nonce(msg)
+                data = json.dumps(msg, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except ValueError:
+            raise
+        except Exception:
+            pass
+        self.decrypted_count += 1
+        return data
+
+    def _validate_protocol(self, msg: Dict[str, Any]) -> None:
+        version = msg.get("protocol_version")
+        if version is None:
+            return
+        try:
+            if int(version) < SECURITY_PROTOCOL_VERSION:
+                raise ValueError("protocol downgrade rejected")
+        except ValueError:
+            raise
+
+    def _validate_timestamp(self, msg: Dict[str, Any]) -> None:
+        if "timestamp" not in msg:
+            return
+        try:
+            ts = float(msg.get("timestamp") or 0)
+        except Exception as exc:
+            raise ValueError("invalid timestamp") from exc
+        if abs(time.time() - ts) > SECURITY_TIMESTAMP_WINDOW_SEC:
+            raise ValueError("timestamp outside accepted window")
+
+    def _validate_nonce(self, msg: Dict[str, Any]) -> None:
+        nonce = str(msg.get("nonce", "") or "")
+        if not nonce:
+            return
+        now = time.time()
+        expired = [n for n, ts in self._seen_nonces.items() if now - ts > SECURITY_TIMESTAMP_WINDOW_SEC]
+        for n in expired:
+            self._seen_nonces.pop(n, None)
+        if nonce in self._seen_nonces:
+            raise ValueError("replay nonce rejected")
+        self._seen_nonces[nonce] = now
+        if len(self._seen_nonces) > SECURITY_REPLAY_CACHE_LIMIT:
+            for n, _ts in sorted(self._seen_nonces.items(), key=lambda item: item[1])[:512]:
+                self._seen_nonces.pop(n, None)
+
+    def wipe(self) -> None:
+        self._seen_nonces.clear()
+        self.session_key = ""
+        self._fernet = None
+
+# ============================================================
+# DATABASE (with safe migrations)
+# ============================================================
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        self._init_tables()
+        self._migrate()
+
+    def _init_tables(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT,
+                salt TEXT,
+                public_key TEXT,
+                avatar_color TEXT DEFAULT '#6c8efb',
+                avatar_image TEXT,
+                totp_secret TEXT,
+                totp_enabled INTEGER DEFAULT 0,
+                totp_failures INTEGER DEFAULT 0,
+                totp_last_fail REAL,
+                role TEXT DEFAULT 'user',
+                created_at REAL,
+                last_seen REAL,
+                ip_address TEXT,
+                last_login REAL,
+                login_count INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT,
+                receiver TEXT,
+                content TEXT,
+                msg_type TEXT DEFAULT 'text',
+                filename TEXT,
+                e2e_meta TEXT,
+                msg_id TEXT,
+                delivered INTEGER DEFAULT 0,
+                read_at REAL,
+                timestamp REAL,
+                ttl INTEGER DEFAULT 0,
+                edited_at REAL,
+                edit_count INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS rooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                owner TEXT,
+                room_type TEXT DEFAULT 'group',
+                join_code TEXT,
+                totp_secret TEXT,
+                require_code INTEGER DEFAULT 0,
+                require_totp INTEGER DEFAULT 0,
+                is_secret INTEGER DEFAULT 0,
+                created_at REAL,
+                max_members INTEGER DEFAULT 0,
+                description TEXT DEFAULT '',
+                icon TEXT
+            );
+            CREATE TABLE IF NOT EXISTS room_members (
+                room_id INTEGER,
+                username TEXT,
+                role TEXT DEFAULT 'member',
+                joined_at REAL,
+                last_active REAL,
+                PRIMARY KEY (room_id, username)
+            );
+            CREATE TABLE IF NOT EXISTS wall_threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                creator TEXT,
+                body TEXT,
+                created_at REAL,
+                updated_at REAL,
+                is_locked INTEGER DEFAULT 0,
+                is_hidden INTEGER DEFAULT 0,
+                likes INTEGER DEFAULT 0,
+                views INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS wall_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER,
+                author TEXT,
+                content TEXT,
+                created_at REAL,
+                is_hidden INTEGER DEFAULT 0,
+                likes INTEGER DEFAULT 0,
+                edited_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS banned_ips (
+                ip_address TEXT PRIMARY KEY,
+                reason TEXT,
+                banned_at REAL,
+                expires_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS media_sessions (
+                username TEXT,
+                session_id TEXT,
+                chunk_count INTEGER DEFAULT 0,
+                last_update REAL,
+                PRIMARY KEY (username, session_id)
+            );
+        """)
+        self.conn.commit()
+
+    def _migrate(self):
+        """Safe migration without direct string interpolation."""
+        existing_cols = {}
+        for table in ["users", "messages", "wall_threads", "wall_comments", "rooms"]:
+            existing_cols[table] = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+        # users
+        if "totp_failures" not in existing_cols["users"]:
+            self.conn.execute("ALTER TABLE users ADD COLUMN totp_failures INTEGER DEFAULT 0")
+        if "totp_last_fail" not in existing_cols["users"]:
+            self.conn.execute("ALTER TABLE users ADD COLUMN totp_last_fail REAL")
+        if "last_login" not in existing_cols["users"]:
+            self.conn.execute("ALTER TABLE users ADD COLUMN last_login REAL")
+        if "login_count" not in existing_cols["users"]:
+            self.conn.execute("ALTER TABLE users ADD COLUMN login_count INTEGER DEFAULT 0")
+        if "ip_address" not in existing_cols["users"]:
+            self.conn.execute("ALTER TABLE users ADD COLUMN ip_address TEXT")
+
+        # messages
+        if "edited_at" not in existing_cols["messages"]:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN edited_at REAL")
+        if "edit_count" not in existing_cols["messages"]:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN edit_count INTEGER DEFAULT 0")
+        if "ttl" not in existing_cols["messages"]:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN ttl INTEGER DEFAULT 0")
+
+        # wall_threads
+        if "view_count" not in existing_cols["wall_threads"]:
+            self.conn.execute("ALTER TABLE wall_threads ADD COLUMN view_count INTEGER DEFAULT 0")
+
+        # wall_comments
+        if "edited_at" not in existing_cols["wall_comments"]:
+            self.conn.execute("ALTER TABLE wall_comments ADD COLUMN edited_at REAL")
+
+        # rooms
+        if "description" not in existing_cols["rooms"]:
+            self.conn.execute("ALTER TABLE rooms ADD COLUMN description TEXT DEFAULT ''")
+        if "icon" not in existing_cols["rooms"]:
+            self.conn.execute("ALTER TABLE rooms ADD COLUMN icon TEXT")
+
+        self.conn.commit()
+
+    def execute(self, sql: str, params=()):
+        return self.conn.execute(sql, params)
+
+    def commit(self):
+        self.conn.commit()
+
+db = Database()
+
+# ============================================================
+# CLIENT STATE
+# ============================================================
+clients: Dict[str, Dict] = {}
+room_members_cache: Dict[int, Set[str]] = {}
+auth_failures: Dict[str, List[float]] = {}
+totp_failures: Dict[str, List[float]] = {}
+media_chunk_count: Dict[str, int] = {}
+
+def generate_session_key() -> str:
+    return Fernet.generate_key().decode()
+
+def validate_username(name: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_.]{1,32}", name))
+
+def validate_password(pw: str) -> bool:
+    return 1 <= len(pw) <= 128
+
+def auth_limited(ip: str) -> bool:
+    now = time.time()
+    bucket = [t for t in auth_failures.get(ip, []) if now - t < AUTH_FAIL_WINDOW_SEC]
+    auth_failures[ip] = bucket
+    return len(bucket) >= AUTH_FAIL_LIMIT
+
+def register_auth_failure(ip: str) -> None:
+    now = time.time()
+    bucket = [t for t in auth_failures.get(ip, []) if now - t < AUTH_FAIL_WINDOW_SEC]
+    bucket.append(now)
+    auth_failures[ip] = bucket
+
+def clear_auth_failures(ip: str) -> None:
+    auth_failures.pop(ip, None)
+
+def totp_limited(username: str) -> bool:
+    now = time.time()
+    row = db.execute("SELECT totp_failures, totp_last_fail FROM users WHERE username=?", (username,)).fetchone()
+    if not row:
+        return False
+    failures, last_fail = row
+    if failures >= TOTP_FAIL_LIMIT and now - (last_fail or 0) < TOTP_FAIL_WINDOW_SEC:
+        return True
+    return False
+
+def register_totp_failure(username: str) -> None:
+    now = time.time()
+    db.execute("UPDATE users SET totp_failures = totp_failures + 1, totp_last_fail = ? WHERE username=?", (now, username))
+    db.commit()
+
+def clear_totp_failures(username: str) -> None:
+    db.execute("UPDATE users SET totp_failures = 0, totp_last_fail = NULL WHERE username=?", (username,))
+    db.commit()
+
+def hash_password(password: str, salt: bytes = None) -> Tuple[str, str]:
+    if salt is None:
+        salt = os.urandom(32)
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200000)
+    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    return base64.b64encode(key).decode(), base64.b64encode(salt).decode()
+
+def verify_password(password: str, stored_hash: str, salt_b64: str) -> bool:
+    try:
+        salt = base64.b64decode(salt_b64)
+        computed, _ = hash_password(password, salt)
+        return hmac.compare_digest(computed, stored_hash)
+    except:
+        return False
+
+def totp_code(secret_b32: str, t: int = None) -> str:
+    if t is None:
+        t = int(time.time()) // 30
+    try:
+        key = base64.b32decode(str(secret_b32).upper() + "=" * (-len(str(secret_b32)) % 8))
+    except Exception:
+        return "000000"
+    msg = struct.pack(">Q", t)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = h[-1] & 0x0F
+    code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(code % 1000000).zfill(6)
+
+def verify_totp(secret_b32: str, user_code: str, window: int = 1) -> bool:
+    user_code = str(user_code or "").strip()
+    if len(user_code) != 6 or not user_code.isdigit():
+        return False
+    base_t = int(time.time()) // 30
+    for d in range(-window, window + 1):
+        if hmac.compare_digest(totp_code(secret_b32, base_t + d), user_code):
+            return True
+    return False
+
+def is_message_expired(ts: float, ttl: int, now: Optional[float] = None) -> bool:
+    ttl = int(ttl or 0)
+    if ttl <= 0:
+        return False
+    now_v = float(now if now is not None else time.time())
+    return (float(ts or 0.0) + ttl) <= now_v
+
+def room_label(room_id: int) -> str:
+    return f"__room__:{room_id}"
+
+def is_room_member(room_id: int, username: str) -> bool:
+    if room_id in room_members_cache:
+        return username in room_members_cache[room_id]
+    row = db.execute("SELECT 1 FROM room_members WHERE room_id=? AND username=?", (room_id, username)).fetchone()
+    return row is not None
+
+def get_room_members(room_id: int) -> Set[str]:
+    if room_id in room_members_cache:
+        return room_members_cache[room_id]
+    rows = db.execute("SELECT username FROM room_members WHERE room_id=?", (room_id,)).fetchall()
+    members = {row[0] for row in rows}
+    room_members_cache[room_id] = members
+    return members
+
+async def broadcast_to_room(room_id: int, message: dict, exclude: str = None):
+    members = get_room_members(room_id)
+    for username in list(members):
+        if username == exclude:
+            continue
+        if username in clients:
+            writer = clients[username]["writer"]
+            cipher = clients[username]["cipher"]
+            try:
+                enc = cipher.encrypt(json.dumps(message).encode())
+                writer.write(enc + SEP.encode())
+                await writer.drain()
+            except:
+                pass
+
+# ============================================================
+# CLIENT HANDLER
+# ============================================================
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    async with connection_semaphore:
+        addr = writer.get_extra_info('peername')
+        dbg(f"New connection from {addr}")
+        peer_ip = addr[0] if addr else "unknown"
+        username = None
+        cipher = None
+        buffer = ""
+
+        try:
+            if auth_limited(peer_ip):
+                await asyncio.sleep(2.0)
+                writer.write(b"FAIL" + SEP.encode())
+                await writer.drain()
+                writer.close()
+                return
+
+            data = await asyncio.wait_for(reader.readuntil(SEP.encode()), timeout=30)
+            if len(data) > MAX_MESSAGE_SIZE:
+                writer.write(b"FAIL" + SEP.encode())
+                await writer.drain()
+                writer.close()
+                return
+
+            try:
+                raw_str = data.decode(errors="ignore")
+                if raw_str.endswith(SEP):
+                    raw_str = raw_str[:-len(SEP)]
+                auth_msg = json.loads(raw_str)
+            except:
+                register_auth_failure(peer_ip)
+                writer.write(b"FAIL" + SEP.encode())
+                await writer.drain()
+                writer.close()
+                return
+
+            if auth_msg.get("type") != "auth":
+                register_auth_failure(peer_ip)
+                writer.write(b"FAIL" + SEP.encode())
+                await writer.drain()
+                writer.close()
+                return
+
+            username = auth_msg.get("username", "").strip()
+            password = auth_msg.get("password", "")
+            public_key = auth_msg.get("public_key", "")
+
+            if not validate_username(username):
+                register_auth_failure(peer_ip)
+                writer.write(b"FAIL" + SEP.encode())
+                await writer.drain()
+                writer.close()
+                return
+            if not validate_password(password):
+                register_auth_failure(peer_ip)
+                writer.write(b"FAIL" + SEP.encode())
+                await writer.drain()
+                writer.close()
+                return
+            if len(public_key) > 2048:
+                register_auth_failure(peer_ip)
+                writer.write(b"FAIL" + SEP.encode())
+                await writer.drain()
+                writer.close()
+                return
+
+            # Register or authenticate
+            row = db.execute("SELECT password_hash, salt, role, public_key, totp_enabled, totp_secret FROM users WHERE username=?", (username,)).fetchone()
+            if not row:
+                # new user
+                pw_hash, salt_b64 = hash_password(password) if password else ("", "")
+                db.execute("INSERT INTO users (username, password_hash, salt, public_key, created_at, last_seen) VALUES (?,?,?,?,?,?)",
+                           (username, pw_hash, salt_b64, public_key, time.time(), time.time()))
+                db.commit()
+                dbg(f"Registered new user: {username}")
+            else:
+                stored_hash, salt_b64, role, stored_pub, totp_enabled, totp_secret = row
+                if stored_hash and not verify_password(password, stored_hash, salt_b64):
+                    register_auth_failure(peer_ip)
+                    await asyncio.sleep(min(5.0, 0.5 * len(auth_failures.get(peer_ip, []))))
+                    writer.write(b"FAIL" + SEP.encode())
+                    await writer.drain()
+                    writer.close()
+                    return
+                if public_key and public_key != stored_pub:
+                    db.execute("UPDATE users SET public_key=? WHERE username=?", (public_key, username))
+                    db.commit()
+                if totp_enabled:
+                    # TOTP handling will be done after session establishment? Usually in separate packet.
+                    # We'll skip for now, but you can add two-stage auth.
+                    pass
+
+            clear_auth_failures(peer_ip)
+            session_key = generate_session_key()
+            cipher = ServerCryptoLayer(session_key)
+            writer.write(f"KEY:{session_key}{SEP}".encode())
+            await writer.drain()
+
+            old = clients.get(username)
+            if old:
+                try:
+                    old["writer"].close()
+                except Exception:
+                    pass
+
+            clients[username] = {
+                "writer": writer,
+                "cipher": cipher,
+                "rate_limit": [],
+                "addr": addr,
+                "last_seen": time.time(),
+                "media_chunks": 0,
+            }
+
+            db.execute("UPDATE users SET last_seen=?, last_login=?, ip_address=?, login_count=login_count+1 WHERE username=?",
+                       (time.time(), time.time(), addr[0], username))
+            db.commit()
+
+            dbg(f"{username} authenticated")
+            session_key = ""
+            await broadcast_user_list()
+            await deliver_offline_messages(username, writer, cipher)
+
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(reader.read(65536), timeout=CLIENT_IDLE_TIMEOUT_SEC)
+                    if not chunk:
+                        break
+                    if clients.get(username, {}).get("writer") is writer:
+                        clients[username]["last_seen"] = time.time()
+                    buffer += chunk.decode('utf-8', errors='ignore')
+                    while SEP in buffer:
+                        raw, buffer = buffer.split(SEP, 1)
+                        if not raw.strip():
+                            continue
+                        if len(raw) > MAX_MESSAGE_SIZE:
+                            dbg(f"Message too large from {username}, dropping")
+                            continue
+                        try:
+                            decrypted = cipher.decrypt(raw.encode()).decode()
+                            msg = json.loads(decrypted)
+                            await process_message(username, msg, writer, cipher)
+                        except ValueError as e:
+                            dbg(f"Security reject from {username}: {e}")
+                        except Exception as e:
+                            dbg(f"Process error: {e}")
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    dbg(f"Read error: {e}")
+                    break
+
+        except asyncio.TimeoutError:
+            dbg(f"Auth timeout from {addr}")
+        except Exception as e:
+            dbg(f"Client error {addr}: {e}")
+        finally:
+            if username:
+                current = clients.get(username)
+                if current is None or current.get("writer") is writer:
+                    clients.pop(username, None)
+                    await broadcast_user_list()
+                    dbg(f"{username} disconnected")
+            if cipher and hasattr(cipher, "wipe"):
+                cipher.wipe()
+            writer.close()
+            await writer.wait_closed()
+
+async def prune_stale_clients() -> None:
+    now = time.time()
+    stale = []
+    for uname, data in list(clients.items()):
+        last_seen = float(data.get("last_seen", 0.0) or 0.0)
+        writer = data.get("writer")
+        if (last_seen and now - last_seen > CLIENT_STALE_TIMEOUT_SEC) or (writer is not None and writer.is_closing()):
+            stale.append(uname)
+    for uname in stale:
+        data = clients.pop(uname, None)
+        writer = data.get("writer") if data else None
+        try:
+            if writer is not None:
+                writer.close()
+        except Exception:
+            pass
+        dbg(f"{uname} stale disconnected")
+
+async def broadcast_user_list():
+    await prune_stale_clients()
+    users = list(clients.keys())
+    stale = []
+    for uname, data in list(clients.items()):
+        try:
+            msg = json.dumps({"type": "users", "users": users})
+            enc = data["cipher"].encrypt(msg.encode())
+            data["writer"].write(enc + SEP.encode())
+            await data["writer"].drain()
+        except Exception:
+            stale.append(uname)
+    if not stale:
+        return
+    for uname in stale:
+        data = clients.pop(uname, None)
+        writer = data.get("writer") if data else None
+        try:
+            if writer is not None:
+                writer.close()
+        except Exception:
+            pass
+    users = list(clients.keys())
+    for _uname, data in list(clients.items()):
+        try:
+            msg = json.dumps({"type": "users", "users": users})
+            enc = data["cipher"].encrypt(msg.encode())
+            data["writer"].write(enc + SEP.encode())
+            await data["writer"].drain()
+        except Exception:
+            pass
+
+async def deliver_offline_messages(username: str, writer: asyncio.StreamWriter, cipher):
+    rows = db.execute("""
+        SELECT id, sender, content, msg_type, filename, e2e_meta, msg_id, ttl, timestamp
+        FROM messages WHERE receiver=? AND delivered=0 ORDER BY id
+    """, (username,)).fetchall()
+    for row in rows:
+        mid, sender, content, msg_type, filename, e2e_meta, msg_id, ttl, msg_ts = row
+        if is_message_expired(float(msg_ts or 0.0), int(ttl or 0)):
+            db.execute("DELETE FROM messages WHERE id=?", (mid,))
+            db.commit()
+            continue
+        packet_type = str(msg_type or "chat")
+        if packet_type not in ("chat", "msg_reply", "msg_react"):
+            packet_type = "chat"
+        msg = {
+            "type": packet_type,
+            "from": sender,
+            "content": content,
+            "msg_type": msg_type or "text",
+            "msg_id": msg_id,
+            "offline": True
+        }
+        if filename:
+            msg["filename"] = filename
+        if ttl:
+            msg["ttl"] = ttl
+        if e2e_meta:
+            try:
+                msg.update(json.loads(e2e_meta))
+            except:
+                pass
+        enc = cipher.encrypt(json.dumps(msg).encode())
+        writer.write(enc + SEP.encode())
+        await writer.drain()
+        db.execute("UPDATE messages SET delivered=1 WHERE id=?", (mid,))
+        db.commit()
+
+async def process_message(sender: str, msg: dict, writer: asyncio.StreamWriter, cipher):
+    msg_type = msg.get("type", "chat")
+
+    # WebRTC signalling
+    if msg_type in {"call_invite", "call_accept", "call_reject", "call_end", "call_audio",
+                    "call_offer", "call_answer", "call_ice", "call_reconnect", "call_failed"}:
+        target = str(msg.get("to", "") or "")
+        if target in clients:
+            fwd = dict(msg)
+            fwd["from"] = sender
+            fwd["to"] = target
+            enc = clients[target]["cipher"].encrypt(json.dumps(fwd).encode())
+            clients[target]["writer"].write(enc + SEP.encode())
+            await clients[target]["writer"].drain()
+        return
+
+    # Rate limiting
+    client_data = clients.get(sender, {})
+    rate_list = client_data.get("rate_limit", [])
+    now = time.time()
+    rate_list = [t for t in rate_list if now - t < 1]
+    if len(rate_list) >= RATE_LIMIT:
+        return
+    rate_list.append(now)
+    client_data["rate_limit"] = rate_list
+
+    if msg_type in ("chat", "msg_reply", "msg_react"):
+        target = msg.get("to", "global")
+        content = msg.get("content", "")
+        if len(content) > 65535:
+            return  # too long
+        msg_id = msg.get("msg_id", secrets.token_urlsafe(16))
+        reply_to = msg.get("reply_to", "")
+        reply_preview = str(msg.get("reply_preview", "") or "")[:200]
+        react_to = str(msg.get("react_to", "") or "")
+        react_emoji = str(msg.get("react_emoji", "") or "")[:8]
+        mentions_raw = msg.get("mentions", [])
+        mentions = []
+        if isinstance(mentions_raw, (list, tuple, set)):
+            for m in mentions_raw:
+                uname = str(m or "").strip()
+                if uname and validate_username(uname) and uname != sender and uname not in mentions:
+                    mentions.append(uname)
+        timestamp = msg.get("timestamp", time.time())
+        ttl = int(msg.get("ttl", 0) or 0)
+        if ttl > 86400 * 30:
+            ttl = 86400 * 30  # max 30 days
+        meta = {
+            "reply_preview": reply_preview,
+            "react_to": react_to,
+            "react_emoji": react_emoji,
+            "mentions": mentions,
+            "to": target,
+        }
+        meta_json = json.dumps(meta, ensure_ascii=False)
+
+        # Room message
+        if target.startswith("__room__:"):
+            try:
+                room_id = int(target.split(":")[1])
+                if is_room_member(room_id, sender):
+                    db.execute("""
+                        INSERT INTO messages (sender, receiver, content, msg_type, e2e_meta, msg_id, timestamp, delivered, ttl)
+                        VALUES (?,?,?,?,?,?,?,?,?)
+                    """, (sender, target, content, msg_type, meta_json, msg_id, timestamp, 0, ttl))
+                    db.commit()
+                    broadcast_msg = {
+                        "type": msg_type,
+                        "from": sender,
+                        "to": target,
+                        "content": content,
+                        "msg_id": msg_id,
+                        "room": target,
+                        "ttl": ttl,
+                    }
+                    if reply_to:
+                        broadcast_msg["reply_to"] = reply_to
+                    if reply_preview:
+                        broadcast_msg["reply_preview"] = reply_preview
+                    if react_to:
+                        broadcast_msg["react_to"] = react_to
+                    if react_emoji:
+                        broadcast_msg["react_emoji"] = react_emoji
+                    if mentions:
+                        broadcast_msg["mentions"] = mentions
+                    await broadcast_to_room(room_id, broadcast_msg, exclude=sender)
+                    if mentions:
+                        members = get_room_members(room_id)
+                        for uname in mentions:
+                            if uname in clients and uname in members:
+                                nmsg = {"type": "mention_notify", "from": sender, "to": uname, "chat": target, "msg_id": msg_id}
+                                enc = clients[uname]["cipher"].encrypt(json.dumps(nmsg).encode())
+                                clients[uname]["writer"].write(enc + SEP.encode())
+                                await clients[uname]["writer"].drain()
+            except:
+                pass
+            return
+
+        # Global chat
+        if target == "global":
+            db.execute("""
+                INSERT INTO messages (sender, receiver, content, msg_type, e2e_meta, msg_id, timestamp, delivered, ttl)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (sender, "__global__", content, msg_type, meta_json, msg_id, timestamp, 0, ttl))
+            db.commit()
+            broadcast_msg = {
+                "type": msg_type,
+                "from": sender,
+                "to": "global",
+                "content": content,
+                "msg_id": msg_id,
+                "ttl": ttl,
+            }
+            if reply_to:
+                broadcast_msg["reply_to"] = reply_to
+            if reply_preview:
+                broadcast_msg["reply_preview"] = reply_preview
+            if react_to:
+                broadcast_msg["react_to"] = react_to
+            if react_emoji:
+                broadcast_msg["react_emoji"] = react_emoji
+            if mentions:
+                broadcast_msg["mentions"] = mentions
+
+            for uname, data in clients.items():
+                if uname != sender:
+                    try:
+                        enc = data["cipher"].encrypt(json.dumps(broadcast_msg).encode())
+                        data["writer"].write(enc + SEP.encode())
+                        await data["writer"].drain()
+                    except:
+                        pass
+            if mentions:
+                for uname in mentions:
+                    if uname in clients:
+                        nmsg = {"type": "mention_notify", "from": sender, "to": uname, "chat": "global", "msg_id": msg_id}
+                        enc = clients[uname]["cipher"].encrypt(json.dumps(nmsg).encode())
+                        clients[uname]["writer"].write(enc + SEP.encode())
+                        await clients[uname]["writer"].drain()
+            return
+
+        # Private message
+        if target in clients:
+            target_data = clients[target]
+            db.execute("""
+                INSERT INTO messages (sender, receiver, content, msg_type, e2e_meta, msg_id, timestamp, delivered, ttl)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (sender, target, content, msg_type, meta_json, msg_id, timestamp, 1, ttl))
+            db.commit()
+            priv_msg = {
+                "type": msg_type,
+                "from": sender,
+                "to": target,
+                "content": content,
+                "msg_id": msg_id,
+                "ttl": ttl,
+            }
+            if reply_to:
+                priv_msg["reply_to"] = reply_to
+            if reply_preview:
+                priv_msg["reply_preview"] = reply_preview
+            if react_to:
+                priv_msg["react_to"] = react_to
+            if react_emoji:
+                priv_msg["react_emoji"] = react_emoji
+            if mentions:
+                priv_msg["mentions"] = mentions
+
+            enc = target_data["cipher"].encrypt(json.dumps(priv_msg).encode())
+            target_data["writer"].write(enc + SEP.encode())
+            await target_data["writer"].drain()
+            if mentions and target in mentions:
+                nmsg = {"type": "mention_notify", "from": sender, "to": target, "chat": target, "msg_id": msg_id}
+                enc = target_data["cipher"].encrypt(json.dumps(nmsg).encode())
+                target_data["writer"].write(enc + SEP.encode())
+                await target_data["writer"].drain()
+
+            ack = {"type": "delivered", "msg_id": msg_id}
+            enc = cipher.encrypt(json.dumps(ack).encode())
+            writer.write(enc + SEP.encode())
+            await writer.drain()
+            ack2 = {"type": "msg_status", "msg_id": msg_id, "status": "delivered", "to": target}
+            enc2 = cipher.encrypt(json.dumps(ack2).encode())
+            writer.write(enc2 + SEP.encode())
+            await writer.drain()
+        else:
+            db.execute("""
+                INSERT INTO messages (sender, receiver, content, msg_type, e2e_meta, msg_id, timestamp, delivered, ttl)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (sender, target, content, msg_type, meta_json, msg_id, timestamp, 0, ttl))
+            db.commit()
+
+    elif msg_type == "typing":
+        target = msg.get("to", "")
+        if target in clients:
+            typing_msg = {"type": "typing", "from": sender}
+            enc = clients[target]["cipher"].encrypt(json.dumps(typing_msg).encode())
+            clients[target]["writer"].write(enc + SEP.encode())
+            await clients[target]["writer"].drain()
+
+    elif msg_type == "msg_read":
+        target = str(msg.get("to", "") or "")
+        mid = str(msg.get("msg_id", "") or "")
+        if target in clients and mid:
+            db.execute("UPDATE messages SET read_at=? WHERE msg_id=? AND receiver=?", (time.time(), mid, sender))
+            db.commit()
+            ack = {"type": "msg_status", "msg_id": mid, "status": "read", "from": sender}
+            enc = clients[target]["cipher"].encrypt(json.dumps(ack).encode())
+            clients[target]["writer"].write(enc + SEP.encode())
+            await clients[target]["writer"].drain()
+
+    elif msg_type == "ping":
+        pong = {"type": "pong", "timestamp": float(msg.get("timestamp", time.time()) or time.time())}
+        enc = cipher.encrypt(json.dumps(pong).encode())
+        writer.write(enc + SEP.encode())
+        await writer.drain()
+
+    elif msg_type == "logout":
+        current = clients.get(sender)
+        if current is None or current.get("writer") is writer:
+            clients.pop(sender, None)
+            dbg(f"{sender} logged out")
+        try:
+            writer.close()
+        except Exception:
+            pass
+        await broadcast_user_list()
+        return
+
+    elif msg_type in {"users", "user_list"}:
+        await prune_stale_clients()
+        users_msg = {"type": "users", "users": list(clients.keys())}
+        enc = cipher.encrypt(json.dumps(users_msg).encode())
+        writer.write(enc + SEP.encode())
+        await writer.drain()
+
+    elif msg_type == "media_meta":
+        target = str(msg.get("to", "") or "")
+        # simple rate limit for media
+        current = media_chunk_count.get(sender, 0)
+        if current > MEDIA_CHUNK_LIMIT:
+            return
+        media_chunk_count[sender] = current + 1
+        if target.startswith("__room__:"):
+            try:
+                room_id = int(target.split(":")[1])
+                if is_room_member(room_id, sender):
+                    fwd = dict(msg)
+                    fwd["from"] = sender
+                    await broadcast_to_room(room_id, fwd, exclude=sender)
+            except:
+                pass
+        elif target == "global":
+            fwd = dict(msg)
+            fwd["from"] = sender
+            for uname, data in clients.items():
+                if uname == sender:
+                    continue
+                try:
+                    enc = data["cipher"].encrypt(json.dumps(fwd).encode())
+                    data["writer"].write(enc + SEP.encode())
+                    await data["writer"].drain()
+                except:
+                    pass
+        elif target in clients:
+            fwd = dict(msg)
+            fwd["from"] = sender
+            enc = clients[target]["cipher"].encrypt(json.dumps(fwd).encode())
+            clients[target]["writer"].write(enc + SEP.encode())
+            await clients[target]["writer"].drain()
+            mid = str(msg.get("msg_id", "") or "")
+            if mid:
+                ack = {"type": "msg_status", "msg_id": mid, "status": "delivered", "to": target}
+                enc = cipher.encrypt(json.dumps(ack).encode())
+                writer.write(enc + SEP.encode())
+                await writer.drain()
+        # Reset counter after some time? Not implemented, but will decay over time.
+        # Alternatively, track per session and clean after message.
+
+    elif msg_type == "media_chunk":
+        target = str(msg.get("to", "") or "")
+        current = media_chunk_count.get(sender, 0)
+        if current > MEDIA_CHUNK_LIMIT:
+            return
+        media_chunk_count[sender] = current + 1
+        if target.startswith("__room__:"):
+            try:
+                room_id = int(target.split(":")[1])
+                if is_room_member(room_id, sender):
+                    fwd = dict(msg)
+                    fwd["from"] = sender
+                    await broadcast_to_room(room_id, fwd, exclude=sender)
+            except:
+                pass
+        elif target == "global":
+            fwd = dict(msg)
+            fwd["from"] = sender
+            for uname, data in clients.items():
+                if uname == sender:
+                    continue
+                try:
+                    enc = data["cipher"].encrypt(json.dumps(fwd).encode())
+                    data["writer"].write(enc + SEP.encode())
+                    await data["writer"].drain()
+                except:
+                    pass
+        elif target in clients:
+            fwd = dict(msg)
+            fwd["from"] = sender
+            enc = clients[target]["cipher"].encrypt(json.dumps(fwd).encode())
+            clients[target]["writer"].write(enc + SEP.encode())
+            await clients[target]["writer"].drain()
+            mid = str(msg.get("msg_id", "") or "")
+            if mid:
+                ack = {"type": "msg_status", "msg_id": mid, "status": "delivered", "to": target}
+                enc = cipher.encrypt(json.dumps(ack).encode())
+                writer.write(enc + SEP.encode())
+                await writer.drain()
+
+    elif msg_type == "room_list":
+        rooms_list = []
+        rows = db.execute("""
+            SELECT r.id, r.name, r.owner, r.room_type, r.is_secret,
+                   r.require_code, r.require_totp, r.max_members,
+                   (SELECT COUNT(*) FROM room_members WHERE room_id=r.id) as member_count
+            FROM rooms r
+            LEFT JOIN room_members m ON m.room_id = r.id
+            WHERE m.username = ? OR (r.room_type = 'community' AND r.is_secret = 0)
+            GROUP BY r.id
+            ORDER BY r.id DESC
+        """, (sender,)).fetchall()
+        for r in rows:
+            rooms_list.append({
+                "id": r[0], "name": r[1], "owner": r[2], "room_type": r[3],
+                "secret": r[4], "require_code": r[5], "require_totp": r[6],
+                "max_members": r[7], "member_count": r[8],
+                "target": f"__room__:{r[0]}"
+            })
+        resp = {"type": "room_list", "rooms": rooms_list}
+        enc = cipher.encrypt(json.dumps(resp).encode())
+        writer.write(enc + SEP.encode())
+        await writer.drain()
+
+    elif msg_type == "room_create":
+        name = msg.get("name", "").strip()
+        room_type = msg.get("room_type", "group")
+        require_code = 1 if msg.get("require_code", False) else 0
+        require_totp = 1 if msg.get("require_totp", False) else 0
+        max_members = msg.get("max_members", 0)
+        if max_members > 10000:
+            max_members = 10000
+        join_code = secrets.token_urlsafe(8) if require_code else ""
+        totp_secret = base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=") if require_totp else ""
+        is_secret = 1 if room_type == "secret" else 0
+        now = time.time()
+
+        cursor = db.execute("""
+            INSERT INTO rooms (name, owner, room_type, join_code, totp_secret,
+                               require_code, require_totp, is_secret, created_at, max_members)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (name, sender, room_type, join_code, totp_secret,
+              require_code, require_totp, is_secret, now, max_members))
+        room_id = cursor.lastrowid
+        db.execute("INSERT INTO room_members (room_id, username, role, joined_at) VALUES (?,?,?,?)",
+                   (room_id, sender, "owner", now))
+        db.commit()
+        room_members_cache[room_id] = {sender}
+        resp = {"type": "room_created", "room_id": room_id, "name": name, "target": f"__room__:{room_id}"}
+        enc = cipher.encrypt(json.dumps(resp).encode())
+        writer.write(enc + SEP.encode())
+        await writer.drain()
+
+    elif msg_type == "room_join":
+        room_id = msg.get("room_id", 0)
+        code = msg.get("code", "")
+        totp = msg.get("totp", "")
+
+        row = db.execute("""
+            SELECT name, require_code, require_totp, join_code, totp_secret, max_members,
+                   (SELECT COUNT(*) FROM room_members WHERE room_id=?) as member_count
+            FROM rooms WHERE id=?
+        """, (room_id, room_id)).fetchone()
+        if not row:
+            return
+        name, req_code, req_totp, join_code, totp_secret, max_members, member_count = row
+
+        if max_members > 0 and member_count >= max_members:
+            return
+        if req_code and code != join_code:
+            return
+        if req_totp:
+            if totp_limited(sender):
+                return
+            if not verify_totp(totp_secret, totp):
+                register_totp_failure(sender)
+                return
+            clear_totp_failures(sender)
+
+        db.execute("INSERT OR IGNORE INTO room_members (room_id, username, role, joined_at) VALUES (?,?,?,?)",
+                   (room_id, sender, "member", time.time()))
+        db.commit()
+        if room_id in room_members_cache:
+            room_members_cache[room_id].add(sender)
+        else:
+            room_members_cache[room_id] = {sender}
+
+        resp = {"type": "room_joined", "room_id": room_id, "name": name, "target": f"__room__:{room_id}"}
+        enc = cipher.encrypt(json.dumps(resp).encode())
+        writer.write(enc + SEP.encode())
+        await writer.drain()
+
+    elif msg_type == "room_leave":
+        room_id = msg.get("room_id", 0)
+        db.execute("DELETE FROM room_members WHERE room_id=? AND username=?", (room_id, sender))
+        db.commit()
+        if room_id in room_members_cache:
+            room_members_cache[room_id].discard(sender)
+
+    elif msg_type == "wall_list":
+        rows = db.execute("""
+            SELECT id, title, creator, body, created_at, is_locked, is_hidden, likes, views
+            FROM wall_threads WHERE is_hidden=0 ORDER BY id DESC LIMIT 100
+        """).fetchall()
+        threads = [{
+            "id": r[0], "title": r[1], "creator": r[2],
+            "snippet": (r[3][:140] + "...") if len(r[3] or "") > 140 else (r[3] or ""),
+            "created_at": r[4], "locked": r[5], "hidden": r[6], "likes": r[7], "views": r[8]
+        } for r in rows]
+        resp = {"type": "wall_list", "threads": threads}
+        enc = cipher.encrypt(json.dumps(resp).encode())
+        writer.write(enc + SEP.encode())
+        await writer.drain()
+
+    elif msg_type == "wall_create":
+        title = msg.get("title", "").strip()
+        body = msg.get("body", "").strip()
+        if title and len(title) <= 200 and len(body) <= 10000:
+            now = time.time()
+            cursor = db.execute("INSERT INTO wall_threads (title, creator, body, created_at, updated_at) VALUES (?,?,?,?,?)",
+                                (title, sender, body, now, now))
+            thread_id = cursor.lastrowid
+            db.commit()
+            resp = {"type": "wall_created", "thread_id": thread_id}
+            enc = cipher.encrypt(json.dumps(resp).encode())
+            writer.write(enc + SEP.encode())
+            await writer.drain()
+
+    elif msg_type == "wall_comment":
+        thread_id = msg.get("thread_id", 0)
+        content = msg.get("content", "").strip()
+        if content and len(content) <= 2000:
+            now = time.time()
+            db.execute("INSERT INTO wall_comments (thread_id, author, content, created_at) VALUES (?,?,?,?)",
+                       (thread_id, sender, content, now))
+            db.execute("UPDATE wall_threads SET updated_at=? WHERE id=?", (now, thread_id))
+            db.commit()
+            resp = {"type": "wall_commented", "thread_id": thread_id}
+            enc = cipher.encrypt(json.dumps(resp).encode())
+            writer.write(enc + SEP.encode())
+            await writer.drain()
+
+# ============================================================
+# BACKGROUND TASKS
+# ============================================================
+async def cleanup_expired_messages_task():
+    while True:
+        try:
+            now = time.time()
+            rows = db.execute("SELECT id, timestamp, ttl FROM messages WHERE ttl > 0").fetchall()
+            expired_ids = []
+            for mid, ts, ttl in rows:
+                if is_message_expired(float(ts or 0.0), int(ttl or 0), now=now):
+                    expired_ids.append(int(mid))
+            if expired_ids:
+                db.conn.executemany("DELETE FROM messages WHERE id=?", [(x,) for x in expired_ids])
+                db.commit()
+        except Exception as e:
+            dbg(f"cleanup task error: {e}")
+        await asyncio.sleep(30)
+
+async def cleanup_stale_clients_task():
+    while True:
+        try:
+            before = set(clients.keys())
+            await prune_stale_clients()
+            if before != set(clients.keys()):
+                await broadcast_user_list()
+        except Exception as e:
+            dbg(f"stale clients cleanup error: {e}")
+        await asyncio.sleep(15)
+
+async def cleanup_media_chunks_task():
+    """Reset media chunk counters every 60 seconds to prevent DoS via slow leak."""
+    while True:
+        await asyncio.sleep(60)
+        media_chunk_count.clear()
+
+# ============================================================
+# MAIN SERVER
+# ============================================================
+async def main():
+    asyncio.create_task(cleanup_expired_messages_task())
+    asyncio.create_task(cleanup_stale_clients_task())
+    asyncio.create_task(cleanup_media_chunks_task())
+
+    ssl_context = None
+    if TLS_ENABLED:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
+        dbg(f"TLS enabled with cert={TLS_CERT_FILE}")
+
+    server = await asyncio.start_server(handle_client, HOST, PORT, ssl=ssl_context, backlog=MAX_CONNECTIONS)
+    addr = server.sockets[0].getsockname()
+    print("========================================")
+    print("Nexus Obsidian Server v7 (Hardened)")
+    print("========================================")
+    print(f"Listening on {addr[0]}:{addr[1]}")
+    print(f"TLS: {'enabled' if TLS_ENABLED else 'disabled'}")
+    print(f"Max connections: {MAX_CONNECTIONS}")
+    print(f"Rate limit: {RATE_LIMIT} msg/sec")
+    print("========================================")
+
+    async with server:
+        await server.serve_forever()
+
+if __name__ == "__main__":
+    asyncio.run(main()) 
