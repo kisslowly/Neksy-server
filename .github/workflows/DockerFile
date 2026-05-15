@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY server.py .
+COPY requirements.txt . 2>/dev/null || true
+
+RUN pip install --no-cache-dir cryptography
+
+EXPOSE 5556
+
+# Запуск без отладки, логирование можно включить через переменные окружения
+CMD ["python", "-u", "server.py"]
